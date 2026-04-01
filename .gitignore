@@ -1,0 +1,43 @@
+# Local datasets and generated outputs
+data/*
+!data/README.md
+runs/
+
+# Training artifacts
+core_model/experiments/
+core_model/datasets/
+
+# Model checkpoints & weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.mdb
+
+# Submodule repos (cloned locally)
+module_A_offline/A1_flame_extraction/VHAP/
+module_A_offline/A2_3dgs_avatar/GaussianAvatars/
+module_A_offline/A3_voice_clone/CosyVoice/
+module_D_diffusion/D1_latentsync/LatentSync/
+module_D_diffusion/D2_echomimic/echomimic_v2/
+module_D_diffusion/D3_fantasytalking/fantasy-talking/
+module_D_diffusion/D4_omniavatar/OmniAvatar/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
