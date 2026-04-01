@@ -35,6 +35,7 @@ env/
 # Tooling caches
 .mypy_cache/
 .pytest_cache/
+.claude/
 
 # OS/editor files
 .DS_Store
