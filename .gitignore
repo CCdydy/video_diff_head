@@ -1,0 +1,23 @@
+# Local datasets and generated outputs
+data/*
+!data/README.md
+runs/
+
+# Training artifacts
+core_model/experiments/
+core_model/datasets/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
