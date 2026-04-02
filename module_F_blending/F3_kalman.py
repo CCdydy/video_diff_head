@@ -107,7 +107,7 @@ def kalman_smooth_frames(
                                 borderMode=cv2.BORDER_REPLICATE)
 
         # Blend: warp only inside face mask
-        from module_C_visual.C2_segment.mask_utils import soft_mask as make_soft
+        from module_C_visual.mask_utils import soft_mask as make_soft
         weight = make_soft(mask, blur_radius=15)[:, :, np.newaxis]
         blended = warped.astype(np.float64) * weight + frame.astype(np.float64) * (1 - weight)
         result.append(np.clip(blended, 0, 255).astype(np.uint8))

@@ -22,6 +22,8 @@ module_A_offline/A3_voice_clone/CosyVoice/
 module_D_diffusion/D1_fantasytalking/fantasy-talking/
 module_D_diffusion/D2_vace/VACE-Wan2.1-14B/
 module_D_diffusion/D3_omniavatar/OmniAvatar/
+third_party/ProPainter/
+third_party/Wan2.1/
 
 # Python
 __pycache__/
