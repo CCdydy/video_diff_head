@@ -33,6 +33,13 @@ create_env() {
 
 setup_wan_audio() {
     create_env wan_audio 3.10
+
+    local third_party_bootstrap="$ROOT_DIR/scripts/setup_third_party.sh"
+    if [[ -f "$third_party_bootstrap" ]]; then
+        log "Bootstrapping third-party source trees..."
+        bash "$third_party_bootstrap"
+    fi
+
     log "Installing PyTorch (cu128)..."
     conda run -n wan_audio --live-stream pip install \
         torch torchvision torchaudio \
@@ -42,29 +49,31 @@ setup_wan_audio() {
     conda run -n wan_audio --live-stream pip install \
         diffusers transformers accelerate
 
-    local req="$ROOT_DIR/module_D_diffusion/D1_fantasytalking/fantasy-talking/requirements.txt"
+    local req="$ROOT_DIR/third_party/Wan2.1/requirements.txt"
     if [[ -f "$req" ]]; then
-        log "Installing FantasyTalking requirements..."
+        log "Installing Wan2.1 requirements..."
         conda run -n wan_audio --live-stream pip install -r "$req"
+        log "Installing local Wan2.1 package..."
+        conda run -n wan_audio --live-stream pip install -e "$ROOT_DIR/third_party/Wan2.1"
     else
-        warn "FantasyTalking not cloned yet. After cloning, run:"
+        warn "Wan2.1 source tree not ready. After bootstrapping, run:"
         warn "  conda run -n wan_audio pip install -r $req"
     fi
 
     log ""
     log "wan_audio ready. Download model weights:"
-    log "  # Wan2.1-I2V-14B"
-    log "  huggingface-cli download Wan-AI/Wan2.1-I2V-14B-720P \\"
-    log "    --local-dir $ROOT_DIR/module_D_diffusion/D1_fantasytalking/fantasy-talking/models/Wan2.1-I2V-14B-720P"
+    log "  # Wan2.1-VACE-14B"
+    log "  huggingface-cli download Wan-AI/Wan2.1-VACE-14B \\"
+    log "    --local-dir $ROOT_DIR/data/models/Wan2.1-VACE-14B"
     log "  # wav2vec2"
     log "  huggingface-cli download facebook/wav2vec2-base-960h \\"
-    log "    --local-dir $ROOT_DIR/module_D_diffusion/D1_fantasytalking/fantasy-talking/models/wav2vec2-base-960h"
+    log "    --local-dir $ROOT_DIR/data/models/wav2vec2-base-960h"
     log "  # FantasyTalking adapter"
     log "  huggingface-cli download acvlab/FantasyTalking fantasytalking_model.ckpt \\"
-    log "    --local-dir $ROOT_DIR/module_D_diffusion/D1_fantasytalking/fantasy-talking/models"
-    log "  # VACE"
-    log "  huggingface-cli download ali-vilab/VACE-Wan2.1-14B \\"
-    log "    --local-dir $ROOT_DIR/module_D_diffusion/D2_vace/VACE-Wan2.1-14B"
+    log "    --local-dir $ROOT_DIR/data/models"
+    log "  # SAM2"
+    log "  huggingface-cli download facebook/sam2-hiera-large \\"
+    log "    --local-dir $ROOT_DIR/data/models"
 }
 
 # ── status ───────────────────────────────────────────────────

@@ -10,7 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from module_C_visual.C2_segment.mask_utils import mask_centroid
+from module_C_visual.mask_utils import mask_centroid
 
 
 def poisson_blend(

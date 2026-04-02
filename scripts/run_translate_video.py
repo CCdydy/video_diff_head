@@ -1,22 +1,40 @@
-"""run_translate_video.py — One-click video translation entry point.
+"""run_translate_video.py — One-click video translation (Mode 1 / Mode 2).
 
 Usage:
+    conda activate wan_audio
     python scripts/run_translate_video.py \
-        --input data/raw/bi/BI_0112.mp4 \
-        --presenter bi \
-        --target_lang ja \
-        --mode 1 \
-        --output output/BI_0112_ja.mp4
+        --input         data/presenters/bi/raw/BI_001.mp4 \
+        --presenter     bi \
+        --target_lang   ja \
+        --output        runs/BI_001_ja.mp4 \
+        --mode          2 \
+        --num_steps     25 \
+        --audio_cfg     2.0 \
+        --lip_strength  0.55 \
+        --face_strength 0.35 \
+        --body_strength 0.15
 
-Modes:
-    1 = FantasyTalking I2V (fast, ready now)
-    2 = VACE masked V2V + audio (precise, requires adapter integration)
+Mode 1: lip-only local replacement (faster, for similar speech rhythm)
+Mode 2: upper-body complete rebuild (default, for cross-language)
+
+Pipeline order (§合成流程顺序):
+  ① ProPainter clean_bg (offline, pre-computed)
+  ② VACE diffusion + audio conditioning
+  ③ Three-layer alpha compositing
+  ④ Poisson seamlessClone
+  ⑤ Kalman landmark smoothing
+  ⑥ LAB color harmonization
+  ⑦ SyncNet QA
+  ⑧ FFmpeg mux
 """
 
 import argparse
 import os
 import sys
 import tempfile
+
+import numpy as np
+import cv2
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
@@ -32,47 +50,64 @@ def extract_frames(video: str, out_dir: str, fps: int = 25):
         raise RuntimeError("ffmpeg frame extraction failed")
 
 
+def load_frames(d: str) -> list[np.ndarray]:
+    files = sorted(f for f in os.listdir(d) if f.endswith('.png'))
+    return [cv2.imread(os.path.join(d, f)) for f in files]
+
+
+def save_frames(frames: list[np.ndarray], d: str):
+    os.makedirs(d, exist_ok=True)
+    for i, f in enumerate(frames):
+        cv2.imwrite(os.path.join(d, f'{i:06d}.png'), f)
+
+
+def load_masks_npz(npz_path: str) -> dict[str, np.ndarray]:
+    data = np.load(npz_path)
+    return {k: data[k] for k in data.files}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Video translation pipeline')
     parser.add_argument('--input', required=True, help='Input video')
-    parser.add_argument('--presenter', default='bi', help='Presenter ID')
+    parser.add_argument('--presenter', default='bi')
     parser.add_argument('--target_lang', default='ja')
-    parser.add_argument('--mode', type=int, choices=[1, 2], default=1)
-    parser.add_argument('--output', default='output/translated.mp4')
+    parser.add_argument('--output', default='runs/translated.mp4')
+    parser.add_argument('--mode', type=int, choices=[1, 2], default=2)
     parser.add_argument('--work_dir', default=None)
     parser.add_argument('--fps', type=int, default=25)
-    # Mode 1 params
-    parser.add_argument('--audio_cfg', type=float, default=4.0)
-    parser.add_argument('--num_inference_steps', type=int, default=30)
+    # Diffusion params
+    parser.add_argument('--num_steps', type=int, default=25)
+    parser.add_argument('--audio_cfg', type=float, default=2.0)
+    parser.add_argument('--lip_strength', type=float, default=0.55)
+    parser.add_argument('--face_strength', type=float, default=0.35)
+    parser.add_argument('--body_strength', type=float, default=0.15)
     parser.add_argument('--chunk_size', type=int, default=81)
     parser.add_argument('--overlap', type=int, default=13)
-    # Mode 2 params
-    parser.add_argument('--strength_lips', type=float, default=0.50)
-    parser.add_argument('--strength_face', type=float, default=0.35)
-    parser.add_argument('--strength_shoulder', type=float, default=0.15)
-    parser.add_argument('--num_steps', type=int, default=25)
+    parser.add_argument('--expand', type=int, default=4,
+                        help='Audio window expansion (increase for fast speech)')
+    # Optimization
+    parser.add_argument('--t5_cpu', action='store_true')
+    parser.add_argument('--offload_model', action='store_true')
+    parser.add_argument('--teacache', type=float, default=0.0,
+                        help='TeaCache threshold (0=off, 0.15=recommended)')
     args = parser.parse_args()
 
     work = args.work_dir or tempfile.mkdtemp(prefix='vtrans_')
     os.makedirs(work, exist_ok=True)
     print(f"Work dir: {work}")
 
-    frames_dir = os.path.join(work, 'frames')
-    masks_dir = os.path.join(work, 'masks')
-    audio_dir = os.path.join(work, 'audio')
-    gen_dir = os.path.join(work, 'gen')
-    composite_dir = os.path.join(work, 'composite')
-
-    ref_frame = f'data/presenters/bi_ref_frames/{args.presenter.upper()}_ref.png'
+    presenter_dir = os.path.join('data', 'presenters', args.presenter)
 
     # ── 1. Extract frames ────────────────────────────────────
-    print("\n[1/6] Extracting frames...")
+    print("\n[1/8] Extracting frames...")
+    frames_dir = os.path.join(work, 'frames')
     extract_frames(args.input, frames_dir, args.fps)
-    n_frames = len([f for f in os.listdir(frames_dir) if f.endswith('.png')])
-    print(f"  {n_frames} frames @ {args.fps}fps")
+    orig_frames = load_frames(frames_dir)
+    print(f"  {len(orig_frames)} frames @ {args.fps}fps")
 
-    # ── 2. Audio pipeline (ASR → translate → TTS) ────────────
-    print("\n[2/6] Audio pipeline...")
+    # ── 2. Audio pipeline ────────────────────────────────────
+    print("\n[2/8] Audio pipeline (ASR → translate → TTS)...")
+    audio_dir = os.path.join(work, 'audio')
     os.makedirs(audio_dir, exist_ok=True)
     new_audio = os.path.join(audio_dir, 'new_audio.wav')
 
@@ -85,183 +120,126 @@ def main():
         trans_out = os.path.join(audio_dir, 'translation.json')
         transcribe(args.input, asr_out)
         translate(asr_out, trans_out, target_lang=args.target_lang)
-        synthesize(trans_out, new_audio,
-                   voice_prompt=f'data/presenters/{args.presenter}/voice_prompt.pt')
+        voice_prompt = os.path.join(presenter_dir, 'voice_prompt.pt')
+        synthesize(trans_out, new_audio, voice_prompt=voice_prompt)
     except (ImportError, NotImplementedError) as e:
-        print(f"  [skip] Audio pipeline not ready: {e}")
-        print(f"  Provide audio manually: {new_audio}")
+        print(f"  [skip] {e}")
         if not os.path.isfile(new_audio):
-            # Extract original audio as fallback
+            print(f"  Extracting original audio as fallback...")
             os.system(f'ffmpeg -i "{args.input}" -vn -ar 16000 -ac 1 '
                       f'"{new_audio}" -y -hide_banner -loglevel error')
 
-    # ── 3. SAM2 mask tracking ────────────────────────────────
-    print("\n[3/6] SAM2 mask tracking...")
-    try:
-        from module_C_visual.C2_segment.sam2_tracker import FaceTracker
-        tracker = FaceTracker()
-        masks = tracker.track(frames_dir, dilate_px=10)
-        for key in ('face_mask', 'upper_body_mask'):
-            out = os.path.join(masks_dir, key)
-            os.makedirs(out, exist_ok=True)
-            import cv2
-            for i, m in enumerate(masks[key]):
-                cv2.imwrite(os.path.join(out, f'{i:06d}.png'), m)
-    except (ImportError, RuntimeError) as e:
-        print(f"  [skip] SAM2 not available: {e}")
-        print(f"  Provide masks at: {masks_dir}/upper_body_mask/")
+    # ── 3. Load pre-computed masks ───────────────────────────
+    print("\n[3/8] Loading masks...")
+    npz_path = os.path.join(presenter_dir, 'masks', 'masks.npz')
+    if os.path.isfile(npz_path):
+        mask_data = load_masks_npz(npz_path)
+        face_masks = mask_data['face_mask']        # (T, H, W) uint8
+        ub_masks = mask_data['upper_body_mask']     # (T, H, W) uint8
+        print(f"  Loaded {face_masks.shape[0]} masks from npz")
+    else:
+        print(f"  [error] Masks not found at {npz_path}")
+        print(f"  Run: python scripts/preprocess_presenter.py --presenter {args.presenter}")
+        return
 
-    ub_mask_dir = os.path.join(masks_dir, 'upper_body_mask')
-    face_mask_dir = os.path.join(masks_dir, 'face_mask')
+    # ── 4. Build strength map ────────────────────────────────
+    print(f"\n[4/8] Building strength map (mode {args.mode})...")
+    from module_C_visual.mask_utils import build_strength_map
 
-    # ── 4. Upper body re-generation ──────────────────────────
-    print(f"\n[4/6] Mode {args.mode} generation...")
+    # Use first frame's mask as representative
+    smap = build_strength_map(
+        face_masks[0], ub_masks[0],
+        mode=args.mode,
+        lip_strength=args.lip_strength,
+        face_strength=args.face_strength,
+        body_strength=args.body_strength,
+    )
+    print(f"  Strength range: [{smap.min():.2f}, {smap.max():.2f}]")
 
-    if args.mode == 1:
-        # FantasyTalking I2V
-        ft_dir = os.path.join(ROOT, 'module_D_diffusion', 'D1_fantasytalking',
-                              'fantasy-talking')
-        infer_script = os.path.join(ft_dir, 'infer.py')
+    # ── 5. VACE + audio diffusion ────────────────────────────
+    print(f"\n[5/8] VACE diffusion ({args.num_steps} steps)...")
+    from module_D_diffusion.vace_audio_pipeline import VACEAudioPipeline
 
-        if os.path.isfile(infer_script):
-            os.makedirs(gen_dir, exist_ok=True)
-            cmd = (
-                f'python "{infer_script}"'
-                f' --image_path "{ref_frame}"'
-                f' --audio_path "{new_audio}"'
-                f' --prompt "a presenter talking, upper body shot, natural gestures"'
-                f' --num_inference_steps {args.num_inference_steps}'
-                f' --audio_cfg {args.audio_cfg}'
-                f' --output_path "{gen_dir}"'
-            )
-            print(f"  Running: {cmd}")
-            ret = os.system(cmd)
-            if ret != 0:
-                print("  [error] FantasyTalking inference failed")
-                return
+    ref_frame_path = os.path.join(presenter_dir, 'ref_frame.png')
+    ref_frame = cv2.imread(ref_frame_path)
+    if ref_frame is None:
+        print(f"  [warn] ref_frame not found, using frame 0")
+        ref_frame = orig_frames[0]
+
+    pipeline = VACEAudioPipeline(
+        vace_model_path='data/models/Wan2.1-VACE-14B',
+        wav2vec2_path='data/models/wav2vec2-base-960h',
+        ft_checkpoint='data/models/fantasytalking_audio_adapter.ckpt',
+        t5_cpu=args.t5_cpu,
+        offload_model=args.offload_model,
+    )
+
+    # Select masks based on mode
+    edit_masks = [face_masks[i] for i in range(len(orig_frames))] if args.mode == 1 \
+        else [ub_masks[i] for i in range(len(orig_frames))]
+
+    edited_frames = pipeline.run_long_video(
+        src_frames=orig_frames,
+        src_masks=edit_masks,
+        audio_path=new_audio,
+        ref_frame=ref_frame,
+        strength_map=smap,
+        chunk_size=args.chunk_size,
+        overlap=args.overlap,
+        num_steps=args.num_steps,
+        audio_cfg=args.audio_cfg,
+    )
+
+    # ── 6. Three-layer compositing ───────────────────────────
+    print("\n[6/8] Compositing...")
+    from module_F_blending.F1_composite import composite_mode1, composite_mode2
+
+    composited = []
+    for i in range(len(orig_frames)):
+        mask = ub_masks[i] if args.mode == 2 else face_masks[i]
+        if args.mode == 1:
+            c = composite_mode1(orig_frames[i], edited_frames[i], mask)
         else:
-            print(f"  [error] FantasyTalking not found at {ft_dir}")
-            print(f"  Clone: git clone https://github.com/Fantasy-AMAP/fantasy-talking.git {ft_dir}")
-            return
+            c = composite_mode2(edited_frames[i], orig_frames[i], mask)
+        composited.append(c)
 
-    elif args.mode == 2:
-        # VACE + audio
-        try:
-            from module_D_diffusion.D2_vace.vace_audio_pipeline import (
-                build_vace_audio_model, run_vace_audio,
-            )
-            from module_C_visual.C2_segment.mask_utils import build_region_strength_map
-            import cv2
-            import numpy as np
+    # ── 6b. Poisson boundary blend ───────────────────────────
+    from module_F_blending.F2_poisson import poisson_blend
 
-            # Build strength map from first frame's masks
-            face_m = cv2.imread(os.path.join(face_mask_dir, '000001.png'),
-                                cv2.IMREAD_GRAYSCALE)
-            ub_m = cv2.imread(os.path.join(ub_mask_dir, '000001.png'),
-                              cv2.IMREAD_GRAYSCALE)
-            smap = build_region_strength_map(
-                face_m, ub_m,
-                strength_lips=args.strength_lips,
-                strength_face=args.strength_face,
-                strength_shoulder=args.strength_shoulder,
-            )
+    for i in range(len(composited)):
+        mask = ub_masks[i] if args.mode == 2 else face_masks[i]
+        composited[i] = poisson_blend(edited_frames[i], composited[i], mask)
 
-            vace_ckpt = os.path.join(ROOT, 'module_D_diffusion', 'D2_vace',
-                                     'VACE-Wan2.1-14B')
-            ft_ckpt = os.path.join(ft_dir, 'models', 'fantasytalking_model.ckpt')
+    # ── 6c. Kalman smoothing (Mode 1 only) ───────────────────
+    if args.mode == 1:
+        print("  Kalman smoothing...")
+        from module_F_blending.F3_kalman import kalman_smooth_frames
+        composited = kalman_smooth_frames(
+            composited, [face_masks[i] for i in range(len(composited))])
 
-            pipe, audio_proj = build_vace_audio_model(vace_ckpt, ft_ckpt)
-            frames = run_vace_audio(
-                pipe, audio_proj,
-                args.input, ub_mask_dir, new_audio, ref_frame, smap,
-                num_steps=args.num_steps,
-            )
-            os.makedirs(gen_dir, exist_ok=True)
-            for i, f in enumerate(frames):
-                cv2.imwrite(os.path.join(gen_dir, f'{i:06d}.png'), f)
-        except (ImportError, FileNotFoundError) as e:
-            print(f"  [error] VACE pipeline not ready: {e}")
-            return
+    # ── 6d. LAB color harmonization ──────────────────────────
+    print("  Color harmonization...")
+    from module_F_blending.F4_color_harmonize import histogram_match_region
 
-    # ── 5. Compositing ───────────────────────────────────────
-    print("\n[5/6] Compositing...")
-    os.makedirs(composite_dir, exist_ok=True)
+    for i in range(len(composited)):
+        mask = ub_masks[i] if args.mode == 2 else face_masks[i]
+        composited[i] = histogram_match_region(composited[i], orig_frames[i], mask)
 
-    try:
-        from module_F_blending.F1_composite import composite_mode1, composite_mode2
-        from module_F_blending.F2_poisson import poisson_blend
-        from module_F_blending.F4_color_harmonize import histogram_match_region
-        import cv2
+    composite_dir = os.path.join(work, 'composite')
+    save_frames(composited, composite_dir)
 
-        gen_files = sorted(os.listdir(gen_dir))
-        orig_files = sorted(os.listdir(frames_dir))
-        mask_files = sorted(os.listdir(ub_mask_dir)) if os.path.isdir(ub_mask_dir) else []
-
-        n = min(len(gen_files), len(orig_files), len(mask_files)) if mask_files else len(gen_files)
-
-        for i in range(n):
-            gen = cv2.imread(os.path.join(gen_dir, gen_files[i]))
-            orig = cv2.imread(os.path.join(frames_dir, orig_files[i]))
-            mask = cv2.imread(os.path.join(ub_mask_dir, mask_files[i]),
-                              cv2.IMREAD_GRAYSCALE) if mask_files else None
-
-            if args.mode == 1 and mask is not None:
-                out = composite_mode1(orig, gen, mask)
-                out = histogram_match_region(out, orig, mask)
-                out = poisson_blend(gen, out, mask)
-            elif args.mode == 2 and mask is not None:
-                out = composite_mode2(gen, orig, mask)
-            else:
-                out = gen
-
-            cv2.imwrite(os.path.join(composite_dir, f'{i:06d}.png'), out)
-
-        # Kalman smoothing (Mode 1 only)
-        if args.mode == 1 and os.path.isdir(face_mask_dir):
-            print("  Kalman smoothing...")
-            from module_F_blending.F3_kalman import kalman_smooth_frames
-            comp_frames = [cv2.imread(os.path.join(composite_dir, f))
-                           for f in sorted(os.listdir(composite_dir))]
-            face_masks = [cv2.imread(os.path.join(face_mask_dir, f), cv2.IMREAD_GRAYSCALE)
-                          for f in sorted(os.listdir(face_mask_dir))[:len(comp_frames)]]
-            smoothed = kalman_smooth_frames(comp_frames, face_masks)
-            for i, f in enumerate(smoothed):
-                cv2.imwrite(os.path.join(composite_dir, f'{i:06d}.png'), f)
-
-        # ProPainter boundary seam repair
-        if os.path.isdir(ub_mask_dir):
-            print("  Boundary seam repair...")
-            try:
-                from module_C_visual.C2_segment.mask_utils import boundary_seam_mask
-                from module_C_visual.C3_inpaint.propainter_wrapper import inpaint_boundary_seam
-
-                seam_dir = os.path.join(work, 'seam_masks')
-                os.makedirs(seam_dir, exist_ok=True)
-                for f in mask_files[:n]:
-                    m = cv2.imread(os.path.join(ub_mask_dir, f), cv2.IMREAD_GRAYSCALE)
-                    seam = boundary_seam_mask(m, width=20)
-                    cv2.imwrite(os.path.join(seam_dir, f), seam)
-
-                repaired_dir = os.path.join(work, 'repaired')
-                inpaint_boundary_seam(composite_dir, seam_dir, repaired_dir)
-                composite_dir = repaired_dir
-            except (ImportError, FileNotFoundError) as e:
-                print(f"  [skip] ProPainter boundary repair: {e}")
-
-    except ImportError as e:
-        print(f"  [skip] Compositing modules not available: {e}")
-
-    # ── 6. QA + Mux ──────────────────────────────────────────
-    print("\n[6/6] QA + Mux...")
+    # ── 7. SyncNet QA ────────────────────────────────────────
+    print("\n[7/8] SyncNet QA...")
     try:
         from module_G_postprocess.G1_syncnet_qa import syncnet_qa
-        syncnet_qa(composite_dir, new_audio, threshold=3.0)
+        result = syncnet_qa(composite_dir, new_audio, threshold=3.0)
     except (ImportError, NotImplementedError):
-        print("  [skip] SyncNet QA")
+        print("  [skip] SyncNet not available")
 
+    # ── 8. FFmpeg mux ────────────────────────────────────────
+    print("\n[8/8] Muxing output...")
     from module_G_postprocess.G2_mux import mux_output
-    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    mux_output(composite_dir, new_audio, args.output, fps=args.fps)
+    mux_output(composite_dir, new_audio, args.output, fps=args.fps, crf=18)
 
     print(f"\n✓ Done: {args.output}")
     print(f"  Work dir: {work}")

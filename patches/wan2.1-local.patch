@@ -1,0 +1,178 @@
+diff --git a/wan/modules/attention.py b/wan/modules/attention.py
+index 4dbbe03..9fe1550 100644
+--- a/wan/modules/attention.py
++++ b/wan/modules/attention.py
+@@ -108,8 +108,7 @@ def flash_attention(
+             softmax_scale=softmax_scale,
+             causal=causal,
+             deterministic=deterministic)[0].unflatten(0, (b, lq))
+-    else:
+-        assert FLASH_ATTN_2_AVAILABLE
++    elif FLASH_ATTN_2_AVAILABLE:
+         x = flash_attn.flash_attn_varlen_func(
+             q=q,
+             k=k,
+@@ -125,6 +124,22 @@ def flash_attention(
+             causal=causal,
+             window_size=window_size,
+             deterministic=deterministic).unflatten(0, (b, lq))
++    else:
++        # Fallback: PyTorch native SDPA (no flash_attn needed)
++        import torch.nn.functional as F
++        num_heads = q.shape[-2] if q.dim() == 3 else 1
++        head_dim = q.shape[-1]
++        # q,k,v are (total_tokens, num_heads, head_dim) from varlen format
++        # reshape to (b, num_heads, seq, head_dim) for SDPA
++        q2 = q.unflatten(0, (b, lq)).transpose(1, 2)
++        k2 = k.unflatten(0, (b, lk)).transpose(1, 2)
++        v2 = v.unflatten(0, (b, lk)).transpose(1, 2)
++        x = F.scaled_dot_product_attention(
++            q2, k2, v2,
++            dropout_p=dropout_p if dropout_p else 0.0,
++            is_causal=causal,
++            scale=softmax_scale,
++        ).transpose(1, 2)  # (b, lq, num_heads, head_dim)
+ 
+     # output
+     return x.type(out_dtype)
+diff --git a/wan/modules/vace_model.py b/wan/modules/vace_model.py
+index a12d1dd..1ea7fd3 100644
+--- a/wan/modules/vace_model.py
++++ b/wan/modules/vace_model.py
+@@ -134,6 +134,9 @@ class VaceWanModel(WanModel):
+             stride=self.patch_size)
+ 
+     def forward_vace(self, x, vace_context, seq_len, kwargs):
++        # Align devices (accelerate dispatch may split modules)
++        vdev = self.vace_patch_embedding.weight.device
++        vace_context = [u.to(vdev) for u in vace_context]
+         # embeddings
+         c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
+         c = [u.flatten(2).transpose(1, 2) for u in c]
+@@ -147,8 +150,11 @@ class VaceWanModel(WanModel):
+         new_kwargs.update(kwargs)
+ 
+         hints = []
++        dev = self.patch_embedding.weight.device
+         for block in self.vace_blocks:
++            block.to(dev)
+             c, c_skip = block(c, **new_kwargs)
++            block.cpu()
+             hints.append(c_skip)
+         return hints
+ 
+@@ -184,10 +190,14 @@ class VaceWanModel(WanModel):
+             List[Tensor]:
+                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+         """
+-        # if self.model_type == 'i2v':
+-        #     assert clip_fea is not None and y is not None
+-        # params
+         device = self.patch_embedding.weight.device
++        x = [u.to(device) for u in x]
++        t = t.to(device)
++        if isinstance(vace_context, list):
++            vace_context = [v.to(device) for v in vace_context]
++        else:
++            vace_context = vace_context.to(device)
++        context = [c.to(device) for c in context]
+         if self.freqs.device != device:
+             self.freqs = self.freqs.to(device)
+ 
+@@ -240,7 +250,9 @@ class VaceWanModel(WanModel):
+         kwargs['context_scale'] = vace_context_scale
+ 
+         for block in self.blocks:
++            block.to(device)
+             x = block(x, **kwargs)
++            block.cpu()
+ 
+         # head
+         x = self.head(x, e)
+diff --git a/wan/vace.py b/wan/vace.py
+index 8a4f744..45c4673 100644
+--- a/wan/vace.py
++++ b/wan/vace.py
+@@ -121,7 +121,19 @@ class WanVace(WanT2V):
+         if dit_fsdp:
+             self.model = shard_fn(self.model)
+         else:
+-            self.model.to(self.device)
++            # 17.3B BF16 = 34.7GB > 32GB — manual block offload.
++            # Keep non-block params on GPU (~3GB), blocks on CPU (~31GB).
++            # Each block (~0.8GB) moves to GPU per forward call.
++            for name, child in self.model.named_children():
++                if name in ('blocks', 'vace_blocks'):
++                    pass  # keep block lists on CPU
++                else:
++                    child.to(self.device)
++            self.model._manual_offload = True
++            logging.info(
++                f"DiT manual offload: "
++                f"{torch.cuda.memory_allocated()/1e9:.1f}GB GPU"
++                f" (non-block params only)")
+ 
+         self.sample_neg_prompt = config.sample_neg_prompt
+ 
+@@ -375,6 +387,15 @@ class WanVace(WanT2V):
+         z = self.vace_latent(z0, m0)
+ 
+         target_shape = list(z0[0].shape)
++
++        # Free VAE after encode (DiT already dispatched via accelerate)
++        if offload_model:
++            self.vae.model.cpu()
++            z = [zi.cpu() for zi in z] if isinstance(z, list) else z.cpu()
++            del z0, m0
++            import gc
++            gc.collect()
++            torch.cuda.empty_cache()
+         target_shape[0] = int(target_shape[0] / 2)
+         noise = [
+             torch.randn(
+@@ -423,6 +444,9 @@ class WanVace(WanT2V):
+             # sample videos
+             latents = noise
+ 
++            if offload_model:
++                context = [t.to(self.device) for t in context]
++                context_null = [t.to(self.device) for t in context_null]
+             arg_c = {'context': context, 'seq_len': seq_len}
+             arg_null = {'context': context_null, 'seq_len': seq_len}
+ 
+@@ -432,19 +456,21 @@ class WanVace(WanT2V):
+ 
+                 timestep = torch.stack(timestep)
+ 
+-                self.model.to(self.device)
++                z_dev = [zi.to(self.device) for zi in z] \
++                    if isinstance(z, list) else z.to(self.device)
+                 noise_pred_cond = self.model(
+                     latent_model_input,
+                     t=timestep,
+-                    vace_context=z,
++                    vace_context=z_dev,
+                     vace_context_scale=context_scale,
+                     **arg_c)[0]
+                 noise_pred_uncond = self.model(
+                     latent_model_input,
+                     t=timestep,
+-                    vace_context=z,
++                    vace_context=z_dev,
+                     vace_context_scale=context_scale,
+                     **arg_null)[0]
++                del z_dev
+ 
+                 noise_pred = noise_pred_uncond + guide_scale * (
+                     noise_pred_cond - noise_pred_uncond)
+@@ -458,9 +484,8 @@ class WanVace(WanT2V):
+                 latents = [temp_x0.squeeze(0)]
+ 
+             x0 = latents
+-            if offload_model:
+-                self.model.cpu()
+-                torch.cuda.empty_cache()
++            # Bring VAE back to GPU for decoding
++            self.vae.model.to(self.device)
+             if self.rank == 0:
+                 videos = self.decode_latent(x0, input_ref_images)

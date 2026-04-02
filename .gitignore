@@ -37,6 +37,9 @@ env/
 .mypy_cache/
 .pytest_cache/
 .claude/
+third_party/**/__pycache__/
+third_party/Wan2.1/wan.egg-info/
+third_party/ProPainter/weights/*.pth
 
 # OS/editor
 .DS_Store

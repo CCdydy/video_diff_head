@@ -13,7 +13,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from module_C_visual.C2_segment.mask_utils import soft_mask
+from module_C_visual.mask_utils import soft_mask
 
 
 def composite_mode1(
