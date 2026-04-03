@@ -230,20 +230,40 @@ def install_audio_adapter(
 
     # Load pretrained weights if available
     if ft_checkpoint and os.path.isfile(ft_checkpoint):
-        state = torch.load(ft_checkpoint, map_location='cpu')
+        state = torch.load(ft_checkpoint, map_location='cpu',
+                           weights_only=True)
+
+        # FantasyTalking format: {'proj_model': ..., 'audio_processor': dict}
+        # audio_processor keys: "blocks.{i}.cross_attn.processor.{k,v}_proj.weight"
+        # Our processor keys:   "k_audio.weight", "v_audio.weight", "audio_scale"
+        ap_state = state.get('audio_processor', state)
+
+        # Key name mapping: FantasyTalking → our adapter
+        KEY_MAP = {'k_proj.weight': 'k_audio.weight',
+                   'v_proj.weight': 'v_audio.weight'}
+
         loaded = 0
+        has_audio_scale = any('audio_scale' in key for key in ap_state)
+
         for i, proc in enumerate(processors):
-            prefix_patterns = [
-                f'blocks.{i}.audio_processor.',
-                f'transformer.blocks.{i}.audio_processor.',
-                f'audio_blocks.{i}.',
-            ]
+            prefix = f'blocks.{i}.cross_attn.processor.'
             proc_state = {}
-            for key, val in state.items():
-                for prefix in prefix_patterns:
-                    if key.startswith(prefix):
-                        short_key = key[len(prefix):]
-                        proc_state[short_key] = val
+            for key, val in ap_state.items():
+                if key.startswith(prefix):
+                    short_key = key[len(prefix):]
+                    mapped = KEY_MAP.get(short_key, short_key)
+                    proc_state[mapped] = val
+
+            if not proc_state:
+                # Fallback: try other prefix patterns
+                for alt_prefix in [f'blocks.{i}.audio_processor.',
+                                   f'transformer.blocks.{i}.audio_processor.',
+                                   f'audio_blocks.{i}.']:
+                    for key, val in ap_state.items():
+                        if key.startswith(alt_prefix):
+                            short_key = key[len(alt_prefix):]
+                            proc_state[short_key] = val
+                    if proc_state:
                         break
 
             if proc_state:
@@ -252,6 +272,17 @@ def install_audio_adapter(
 
         print(f"[adapter] Loaded weights for {loaded}/{len(processors)} blocks "
               f"from {ft_checkpoint}")
+
+        # FantasyTalking checkpoint has no audio_scale — it stays at init(0),
+        # making tanh(0)=0 which zeroes out all audio contribution.
+        # Set to a meaningful initial value so the pretrained k/v weights
+        # actually produce output.  tanh(0.5) ≈ 0.46.
+        if not has_audio_scale:
+            for proc in processors:
+                with torch.no_grad():
+                    proc.audio_scale.fill_(0.5)
+            print(f"[adapter] audio_scale initialized to 0.5 "
+                  f"(tanh≈0.46, checkpoint had no audio_scale)")
 
     return processors
 
@@ -274,10 +305,19 @@ def extract_wav2vec2(
     processor = Wav2Vec2Processor.from_pretrained(model_path)
     model = Wav2Vec2Model.from_pretrained(model_path).to(device).eval()
 
-    waveform, sr = torchaudio.load(audio_path)
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-    waveform = waveform.mean(0)  # mono
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        waveform = waveform.mean(0)  # mono
+    except Exception:
+        # Fallback: soundfile (torchaudio 2.11+ may require torchcodec)
+        import soundfile as sf
+        data, sr = sf.read(audio_path, always_2d=True)
+        data = data.mean(axis=1)  # mono (numpy)
+        waveform = torch.tensor(data).float()
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform.unsqueeze(0), sr, 16000).squeeze(0)
 
     inputs = processor(waveform.numpy(), sampling_rate=16000,
                        return_tensors='pt', padding=True)
@@ -311,6 +351,7 @@ class VACEAudioPipeline:
         self.device = device
         self.dtype = dtype
         self.wav2vec2_path = wav2vec2_path
+        self.offload_model = offload_model
 
         # Load VACE pipeline
         # The exact import depends on which VACE distribution is used.
@@ -323,16 +364,23 @@ class VACEAudioPipeline:
 
         # Load audio_proj weights from FantasyTalking checkpoint
         if ft_checkpoint and os.path.isfile(ft_checkpoint):
-            state = torch.load(ft_checkpoint, map_location='cpu')
-            proj_state = {}
-            for k, v in state.items():
-                for prefix in ('audio_proj.', 'audio_projection.'):
-                    if k.startswith(prefix):
-                        proj_state[k[len(prefix):]] = v
-                        break
-            if proj_state:
-                self.audio_proj.load_state_dict(proj_state, strict=False)
+            state = torch.load(ft_checkpoint, map_location='cpu',
+                               weights_only=True)
+            # FantasyTalking checkpoint format: {'proj_model': OrderedDict, 'audio_processor': dict}
+            if 'proj_model' in state:
+                self.audio_proj.load_state_dict(state['proj_model'], strict=False)
                 print(f"[pipeline] Loaded AudioProjModel from {ft_checkpoint}")
+            else:
+                # Fallback: flat dict with 'audio_proj.' prefix
+                proj_state = {}
+                for k, v in state.items():
+                    for prefix in ('audio_proj.', 'audio_projection.'):
+                        if k.startswith(prefix):
+                            proj_state[k[len(prefix):]] = v
+                            break
+                if proj_state:
+                    self.audio_proj.load_state_dict(proj_state, strict=False)
+                    print(f"[pipeline] Loaded AudioProjModel from {ft_checkpoint}")
         self.audio_proj.eval()
 
         # Install audio cross-attention processors
@@ -396,6 +444,60 @@ class VACEAudioPipeline:
 
         return windowed
 
+    # ── VACE input/output conversion helpers ────────────────────
+
+    def _frames_to_vace(self, frames: list[np.ndarray], W: int, H: int
+                        ) -> torch.Tensor:
+        """BGR uint8 list → (3, T, H, W) BF16 tensor in [-1, 1]."""
+        import cv2
+        out = []
+        for f in frames:
+            f_rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            if f_rgb.shape[1] != W or f_rgb.shape[0] != H:
+                f_rgb = cv2.resize(f_rgb, (W, H))
+            out.append(f_rgb)
+        arr = np.stack(out, axis=0)                       # (T, H, W, 3)
+        t = torch.from_numpy(arr).permute(3, 0, 1, 2)    # (3, T, H, W)
+        t = t.float().div_(127.5).sub_(1.)                # [-1, 1]
+        return t.to(self.device, self.dtype)
+
+    def _masks_to_vace(self, masks: list[np.ndarray], W: int, H: int
+                       ) -> torch.Tensor:
+        """uint8 (H,W) list → (1, T, H, W) BF16 tensor in [0, 1]."""
+        import cv2
+        out = []
+        for m in masks:
+            if m.shape[1] != W or m.shape[0] != H:
+                m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+            out.append(m)
+        arr = np.stack(out, axis=0).astype(np.float32) / 255.0  # (T, H, W)
+        t = torch.from_numpy(arr).unsqueeze(0)                   # (1, T, H, W)
+        return t.to(self.device, self.dtype)
+
+    def _ref_to_vace(self, ref: np.ndarray, W: int, H: int) -> torch.Tensor:
+        """BGR uint8 frame → (3, 1, H, W) BF16 tensor in [-1, 1]."""
+        import cv2
+        ref_rgb = cv2.cvtColor(ref, cv2.COLOR_BGR2RGB)
+        if ref_rgb.shape[1] != W or ref_rgb.shape[0] != H:
+            ref_rgb = cv2.resize(ref_rgb, (W, H))
+        t = torch.from_numpy(ref_rgb).permute(2, 0, 1)   # (3, H, W)
+        t = t.float().div_(127.5).sub_(1.).unsqueeze(1)   # (3, 1, H, W) [-1,1]
+        return t.to(self.device, self.dtype)
+
+    def _vace_tensor_to_frames(self, video: torch.Tensor,
+                               orig_h: int, orig_w: int) -> list[np.ndarray]:
+        """(3, T, H, W) [-1,1] tensor → list of BGR uint8 ndarray."""
+        import cv2
+        out = video.clamp(-1, 1).add_(1.).mul_(127.5).byte()  # (3, T, H, W)
+        out = out.permute(1, 2, 3, 0).cpu().numpy()           # (T, H, W, 3) RGB
+        frames = []
+        for f in out:
+            bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+            if bgr.shape[0] != orig_h or bgr.shape[1] != orig_w:
+                bgr = cv2.resize(bgr, (orig_w, orig_h))
+            frames.append(bgr)
+        return frames
+
     def run_chunk(
         self,
         src_frames: list[np.ndarray],
@@ -406,56 +508,78 @@ class VACEAudioPipeline:
         num_steps: int = 25,
         audio_cfg: float = 2.0,
         expand: int = 4,
+        vace_size: tuple = (832, 480),  # (W, H); VACE supports 832×480 or 1280×720
     ) -> list[np.ndarray]:
-        """Run single 81-frame chunk through VACE + audio.
+        """Run single chunk through VACE + audio conditioning.
+
+        Uses wan.WanVace.generate() native API.
 
         Args:
-            src_frames: list of 81 (H,W,3) BGR uint8 frames.
-            src_masks: list of 81 (H,W) uint8 masks (255=edit region).
-            audio_path: path to audio WAV (segment for this chunk).
+            src_frames: list of N (H,W,3) BGR uint8 frames; N must satisfy (N-1)%4==0.
+            src_masks: list of N (H,W) uint8 masks (255 = edit region).
+            audio_path: path to 16kHz mono WAV.
             ref_frame: (H,W,3) BGR reference frame for identity.
-            strength_map: (H,W) float32 per-pixel editing strength.
+            strength_map: (H,W) float32 per-pixel editing strength (reserved).
             num_steps: DDIM denoising steps.
-            audio_cfg: audio guidance scale.
-            expand: audio window expansion.
+            audio_cfg: guidance scale.
+            expand: audio window expansion tokens.
+            vace_size: (W, H) inference resolution. Must be (832,480) or (1280,720).
 
         Returns:
-            list of 81 (H,W,3) BGR uint8 edited frames.
+            list of N (H,W,3) BGR uint8 edited frames at original resolution.
         """
-        import cv2
-
         n_frames = len(src_frames)
-        # Wan2.1 constraint: (N-1) % 4 == 0
         assert (n_frames - 1) % 4 == 0, \
             f"Frame count must satisfy (N-1)%4==0, got {n_frames}"
 
         n_latent_frames = (n_frames - 1) // 4 + 1
+        W, H = vace_size
+        orig_h, orig_w = src_frames[0].shape[:2]
 
-        # Prepare audio conditioning
+        # Prepare audio conditioning (stored on processors for DiT hooks).
+        # VACE prepends ref image latents (n_ref=1), so total latent frames in
+        # the DiT sequence = n_ref + n_latent_frames. We prepare audio_cond for
+        # the video frames only, then pad with zeros for the ref frame(s).
+        n_ref = 1  # VACE always prepends 1 ref image
         audio_cond = self.prepare_audio(audio_path, n_latent_frames, expand)
+        # Pad: (B, n_latent, L_win, C) → (B, n_ref+n_latent, L_win, C)
+        ref_pad = torch.zeros(
+            audio_cond.shape[0], n_ref, audio_cond.shape[2], audio_cond.shape[3],
+            device=audio_cond.device, dtype=audio_cond.dtype)
+        audio_cond_full = torch.cat([ref_pad, audio_cond], dim=1)
+        n_latent_total = n_ref + n_latent_frames  # what DiT actually sees
 
-        # Store audio_cond on processors for the forward pass
         for proc in self.audio_processors:
-            proc._audio_cond = audio_cond
-            proc._n_latent_frames = n_latent_frames
+            proc._audio_cond = audio_cond_full
+            proc._n_latent_frames = n_latent_total
 
-        # Prepare VACE inputs
-        # (exact API depends on VACE version — this is the logical flow)
-        try:
-            output = self.pipe(
-                video=src_frames,
-                mask=src_masks,
-                ref_image=ref_frame,
-                strength=strength_map,
-                num_inference_steps=num_steps,
-                guidance_scale=audio_cfg,
-            )
-            if hasattr(output, 'frames'):
-                return output.frames
-            return output
-        except Exception as e:
-            print(f"[pipeline] VACE inference error: {e}")
-            raise
+        # Convert numpy arrays to VACE tensor format
+        frames_t = self._frames_to_vace(src_frames, W, H)   # (3, T, H, W)
+        masks_t  = self._masks_to_vace(src_masks, W, H)     # (1, T, H, W)
+        ref_t    = self._ref_to_vace(ref_frame, W, H)       # (3, 1, H, W)
+
+        print(f"[pipeline] VACE inference: {n_frames} frames @ {W}×{H}, "
+              f"{num_steps} steps")
+
+        # Run VACE diffusion
+        video = self.pipe.generate(
+            input_prompt="",
+            input_frames=[frames_t],
+            input_masks=[masks_t],
+            input_ref_images=[[ref_t]],
+            size=vace_size,
+            frame_num=n_frames,
+            sampling_steps=num_steps,
+            guide_scale=audio_cfg,
+            offload_model=self.offload_model,
+            seed=42,
+        )
+
+        if video is None:
+            print("[pipeline] WARNING: generate() returned None (multi-GPU mode?)")
+            return src_frames
+
+        return self._vace_tensor_to_frames(video, orig_h, orig_w)
 
     def run_long_video(
         self,
@@ -468,6 +592,8 @@ class VACEAudioPipeline:
         overlap: int = 13,
         num_steps: int = 25,
         audio_cfg: float = 2.0,
+        expand: int = 4,
+        vace_size: tuple = (832, 480),
     ) -> list[np.ndarray]:
         """Process long video with Hamming window chunk blending.
 
@@ -484,6 +610,8 @@ class VACEAudioPipeline:
             overlap: overlap between consecutive chunks.
             num_steps: DDIM steps per chunk.
             audio_cfg: audio guidance scale.
+            expand: audio window expansion tokens.
+            vace_size: VACE inference resolution.
 
         Returns:
             list of all output frames, blended at chunk boundaries.
@@ -491,7 +619,9 @@ class VACEAudioPipeline:
         T = len(src_frames)
         if T <= chunk_size:
             return self.run_chunk(src_frames, src_masks, audio_path,
-                                  ref_frame, strength_map, num_steps, audio_cfg)
+                                  ref_frame, strength_map,
+                                  num_steps=num_steps, audio_cfg=audio_cfg,
+                                  expand=expand, vace_size=vace_size)
 
         # Split into chunks
         stride = chunk_size - overlap
@@ -526,7 +656,9 @@ class VACEAudioPipeline:
             # For now pass full audio — VACE handles temporal alignment
             chunk_output = self.run_chunk(
                 chunk_frames, chunk_masks, audio_path,
-                ref_frame, strength_map, num_steps, audio_cfg,
+                ref_frame, strength_map,
+                num_steps=num_steps, audio_cfg=audio_cfg,
+                expand=expand, vace_size=vace_size,
             )
 
             # Assign with Hamming weights at overlaps

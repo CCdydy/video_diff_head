@@ -66,6 +66,18 @@ def load_masks_npz(npz_path: str) -> dict[str, np.ndarray]:
     return {k: data[k] for k in data.files}
 
 
+def resolve_ft_checkpoint() -> str | None:
+    """Prefer a fine-tuned adapter, then fall back to the base FT checkpoint."""
+    candidates = [
+        os.path.join('data', 'models', 'fantasytalking_audio_adapter.ckpt'),
+        os.path.join('data', 'models', 'fantasytalking_model.ckpt'),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description='Video translation pipeline')
     parser.add_argument('--input', required=True, help='Input video')
@@ -90,6 +102,8 @@ def main():
     parser.add_argument('--offload_model', action='store_true')
     parser.add_argument('--teacache', type=float, default=0.0,
                         help='TeaCache threshold (0=off, 0.15=recommended)')
+    parser.add_argument('--audio_override', default=None,
+                        help='Override audio path (e.g. silence.wav for A/B test)')
     args = parser.parse_args()
 
     work = args.work_dir or tempfile.mkdtemp(prefix='vtrans_')
@@ -111,23 +125,28 @@ def main():
     os.makedirs(audio_dir, exist_ok=True)
     new_audio = os.path.join(audio_dir, 'new_audio.wav')
 
-    try:
-        from module_B_audio.B1_asr.transcribe import transcribe
-        from module_B_audio.B2_translate.translate import translate
-        from module_B_audio.B3_tts.synthesize import synthesize
+    if args.audio_override:
+        import shutil
+        shutil.copy2(args.audio_override, new_audio)
+        print(f"  Using audio override: {args.audio_override}")
+    else:
+        try:
+            from module_B_audio.B1_asr.transcribe import transcribe
+            from module_B_audio.B2_translate.translate import translate
+            from module_B_audio.B3_tts.synthesize import synthesize
 
-        asr_out = os.path.join(audio_dir, 'asr.json')
-        trans_out = os.path.join(audio_dir, 'translation.json')
-        transcribe(args.input, asr_out)
-        translate(asr_out, trans_out, target_lang=args.target_lang)
-        voice_prompt = os.path.join(presenter_dir, 'voice_prompt.pt')
-        synthesize(trans_out, new_audio, voice_prompt=voice_prompt)
-    except (ImportError, NotImplementedError) as e:
-        print(f"  [skip] {e}")
-        if not os.path.isfile(new_audio):
-            print(f"  Extracting original audio as fallback...")
-            os.system(f'ffmpeg -i "{args.input}" -vn -ar 16000 -ac 1 '
-                      f'"{new_audio}" -y -hide_banner -loglevel error')
+            asr_out = os.path.join(audio_dir, 'asr.json')
+            trans_out = os.path.join(audio_dir, 'translation.json')
+            transcribe(args.input, asr_out)
+            translate(asr_out, trans_out, target_lang=args.target_lang)
+            voice_prompt = os.path.join(presenter_dir, 'voice_prompt.pt')
+            synthesize(trans_out, new_audio, voice_prompt=voice_prompt)
+        except (ImportError, NotImplementedError) as e:
+            print(f"  [skip] {e}")
+            if not os.path.isfile(new_audio):
+                print(f"  Extracting original audio as fallback...")
+                os.system(f'ffmpeg -i "{args.input}" -vn -ar 16000 -ac 1 '
+                          f'"{new_audio}" -y -hide_banner -loglevel error')
 
     # ── 3. Load pre-computed masks ───────────────────────────
     print("\n[3/8] Loading masks...")
@@ -166,10 +185,16 @@ def main():
         print(f"  [warn] ref_frame not found, using frame 0")
         ref_frame = orig_frames[0]
 
+    ft_checkpoint = resolve_ft_checkpoint()
+    if ft_checkpoint:
+        print(f"  Adapter checkpoint: {ft_checkpoint}")
+    else:
+        print("  [warn] No FantasyTalking checkpoint found, using zero-init adapter")
+
     pipeline = VACEAudioPipeline(
         vace_model_path='data/models/Wan2.1-VACE-14B',
         wav2vec2_path='data/models/wav2vec2-base-960h',
-        ft_checkpoint='data/models/fantasytalking_audio_adapter.ckpt',
+        ft_checkpoint=ft_checkpoint,
         t5_cpu=args.t5_cpu,
         offload_model=args.offload_model,
     )
@@ -188,6 +213,7 @@ def main():
         overlap=args.overlap,
         num_steps=args.num_steps,
         audio_cfg=args.audio_cfg,
+        expand=args.expand,
     )
 
     # ── 6. Three-layer compositing ───────────────────────────

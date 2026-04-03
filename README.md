@@ -90,13 +90,16 @@ video_trans/
 ├── scripts/
 │   ├── run_translate_video.py       ★ 一键入口（Mode 1 / Mode 2）
 │   ├── preprocess_presenter.py      离线预处理入口
+│   ├── prepare_bi_clips.py          训练 clip 提取
+│   ├── train_audio_adapter.py       实验性 adapter 训练入口
 │   └── setup_envs.sh                conda 环境安装
 │
 └── data/                            本地数据（git ignore）
     ├── models/
     │   ├── Wan2.1-VACE-14B/
     │   ├── wav2vec2-base-960h/
-    │   ├── fantasytalking_audio_adapter.ckpt
+    │   ├── fantasytalking_model.ckpt
+    │   ├── fantasytalking_audio_adapter.ckpt   # 可选：本地微调后导出
     │   └── sam2_hiera_large.pt
     └── presenters/
         └── bi/
@@ -172,10 +175,14 @@ huggingface-cli download facebook/wav2vec2-base-960h \
 huggingface-cli download facebook/sam2-hiera-large \
     --local-dir data/models/
 
-# FantasyTalking audio adapter（作为 adapter 初始化权重）
+# FantasyTalking 基础 checkpoint（作为 adapter 初始化权重）
 huggingface-cli download acvlab/FantasyTalking fantasytalking_model.ckpt \
     --local-dir data/models/
 ```
+
+说明：
+- `data/models/fantasytalking_model.ckpt`：下载得到的基础 FantasyTalking 权重
+- `data/models/fantasytalking_audio_adapter.ckpt`：本项目本地微调后的可选导出文件；如果存在，推理优先使用它
 
 ---
 
@@ -225,6 +232,7 @@ python scripts/run_translate_video.py \
 
 `--mode 1`：仅唇部区域扩散（更快，适合语速接近原始的翻译）
 `--mode 2`：上半身完整重建（默认，适合语言差异大的翻译）
+`--audio_override path/to/audio.wav`：跳过 ASR/TTS，直接替换为指定音频做 A/B 测试
 
 ---
 
@@ -284,32 +292,23 @@ WanAudioCrossAttentionProcessor × 40 blocks:
 
 ---
 
-## 微调方案（可选，提升唇同步质量）
+## 微调方案（实验性）
 
-FantasyTalking 权重作为初始化（I2V→VACE 维度兼容），在 BI 数据上精调：
-
-```
-Stage 1 — 全局音视频对齐
-  数据：53 个 BI 视频（13.4h）
-  Loss：全上半身区域 MSE
-  步数：20K steps
-  LR：1e-4
-  时间：~12 小时（RTX 5090）
-
-Stage 2 — 唇形精细对齐
-  数据：同上
-  Loss：lip region MSE + SyncNet perceptual × 0.1
-  步数：10K steps
-  LR：5e-5
-  时间：~6 小时（RTX 5090）
-```
+当前仓库提供训练数据提取脚本和实验性 adapter 训练入口。推荐先从原始 BI 视频提取 81 帧 clip，再以 `fantasytalking_model.ckpt` 作为初始化权重启动训练：
 
 ```bash
+# 先准备训练 clip：clip_XXXX/{frames/, audio.wav}
+python scripts/prepare_bi_clips.py \
+    --video_dir "data/raw/笔吧视频数据" \
+    --output_dir data/training \
+    --max_clips 500 \
+    --skip_existing
+
 # Stage 1
 python scripts/train_audio_adapter.py \
     --stage 1 --steps 20000 --lr 1e-4 \
     --data_dir data/training/ \
-    --init_ckpt data/models/fantasytalking_audio_adapter.ckpt \
+    --init_ckpt data/models/fantasytalking_model.ckpt \
     --output_dir runs/adapter_stage1/
 
 # Stage 2
@@ -319,6 +318,8 @@ python scripts/train_audio_adapter.py \
     --init_ckpt runs/adapter_stage1/final.ckpt \
     --output_dir runs/adapter_stage2/
 ```
+
+当前训练脚本仍处于实验阶段，主要目标是把 adapter 权重和数据接口先接通；建议把它视为研发入口，而不是已验证完成的最终训练配方。
 
 ---
 
