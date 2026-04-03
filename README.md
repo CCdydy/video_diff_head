@@ -418,57 +418,133 @@ python scripts/train_audio_adapter.py \
 
 ---
 
-## 当前进度（2025-04-02）
+## 当前进度（2026-04-04 更新）
 
-### 已验证通过
+### 里程碑
+
+| 日期 | 事件 |
+|------|------|
+| 2025-04-02 | 项目初始化，RTX 5090 32GB 上验证各模块 |
+| 2026-04-02 | 迁移到 RTX 6000 Ada 48GB，端到端 pipeline 首次跑通 |
+| 2026-04-03 | 音频驱动接入完成（A/B 对比验证差异 6.82），25 步完整版生成 |
+| 2026-04-04 | 训练数据 2000 clips 准备完成，训练脚本调通（显存瓶颈暂停）|
+
+### 当前机器配置
+
+```
+GPU:     NVIDIA RTX 6000 Ada Generation, 48GB (50.86 GB total, 47.37 GiB usable)
+Driver:  580.126.09, CUDA 13.0
+Env:     diffposetalk-camalign (torch 2.11.0+cu130, sam2 1.1.0, wan 2.1.0 editable)
+OS:      Linux 6.8.0-106-generic
+```
+
+### 模块状态
 
 | 步骤 | 状态 | 备注 |
 |------|------|------|
 | 项目结构 + 所有模块代码 | ✅ | 完整实现 |
-| wan_audio conda 环境 | ✅ | PyTorch 2.11.0+cu128, diffusers, transformers, sam2, insightface, mediapipe, opencv |
+| conda 环境 | ✅ | `diffposetalk-camalign`: torch 2.11.0+cu130, sam2, mediapipe, insightface |
 | 模型权重下载 | ✅ | VACE-14B (70GB), wav2vec2 (1.1GB), sam2 (1.7GB), FantasyTalking (3.2GB) |
-| SAM2 mask tracking | ✅ | 250帧@1080p, 7.8fps, 双mask(face+upper_body), 输出npz |
-| InsightFace 人脸检测 | ✅ | buffalo_l 模型自动下载到 ~/.insightface/ |
-| ref_frame 自动选取 | ✅ | 按人脸面积选最优正面帧 |
-| ProPainter 背景修复 | ✅ | 需要 `--resize_ratio 0.5`（1080p OOM），结果在 clean_bg/frames/ |
-| VACE 模型加载 | ✅ | wan.WanVace + t5_cpu=True，GPU仅占0.53GB(VAE) |
-| VACE 音频适配器安装 | ✅ | 40个block全部安装 WanAudioCrossAttentionProcessor |
+| SAM2 mask tracking | ✅ | 250帧@1080p, 双mask(face+upper_body), 输出npz |
+| ProPainter 背景修复 | ✅ | 需要 `--resize_ratio 0.5`（1080p OOM） |
+| VACE 模型加载 | ✅ | block offload: 非block参数GPU(1.47GB), blocks留CPU |
+| VACE 推理 | ✅ | block offload ~136s/step @832×480, 25步 ~57min/chunk |
+| 音频 adapter 注入 DiT | ✅ | 40/40 blocks 注入，FantasyTalking 权重加载 |
+| 音频驱动验证 | ✅ | A/B 对比唇部差异 6.82（有音频 vs 静音），audio_scale=0.5 |
+| 端到端 pipeline | ✅ | 8 步全走通，输出 1920×1080 25fps MP4 |
+| 合成管线 F1-F4 | ✅ | compositing + Poisson + LAB 色调归一化 |
+| FFmpeg mux | ✅ | 正常工作 |
+| 训练数据准备 | ✅ | 2000 clips, 66GB, 832×480 81帧 + 16kHz音频 |
+| 训练脚本 | ✅ | 代码调通，首批 loss=10.4 |
 | 音频管线 B1/B2/B3 | ⏳ stub | FunASR/翻译/CosyVoice 接口已定义，实现待接入 |
-| **VACE 推理** | **❌ 阻塞** | **17.3B BF16=34.7GB > 32GB VRAM** |
-| 合成管线 F1-F4 | ✅ 代码 | 已实现，未实际跑通（依赖 VACE 输出） |
-| SyncNet QA / FFmpeg mux | ✅ 代码 | 已实现 |
+| SyncNet QA | ⏳ | 缺 SyncNet 权重，跳过 |
+| **Adapter 训练** | **⏸ 暂停** | **48GB 显存不足以正确训练（需 80GB），代理 loss ~1.5min/step** |
 
-### 下一步（新机器上）
+### 推理性能实测（RTX 6000 Ada 48GB）
 
-1. **解决 VRAM 问题**（见上方显存需求章节）
-2. 跑通 VACE text-only V2V 推理（不加音频，纯验证 masked editing）
-3. 接入音频 cross-attention（让 WanAudioCrossAttentionProcessor 在 DiT forward 中生效）
-4. 端到端跑通 run_translate_video.py
-5. 接入 CosyVoice 语音克隆
+```
+分辨率: 832×480 (VACE 标准)
+输出:   1920×1080 (上采样回原始分辨率)
+帧率:   25 fps
 
-### 第三方代码修改记录
+推理速度 (block offload, SDPA fallback):
+  1 step:   ~136 秒
+  5 steps:  ~12 分钟/chunk (4 chunks = ~48 min)
+  25 steps: ~57 分钟/chunk (4 chunks = ~3.7 h)
+
+音频特征提取 (wav2vec2): ~2 秒
+VAE encode/decode: ~5 秒
+合成 + Poisson + 色调归一化: ~30 秒
+```
+
+### 显存需求分析
+
+| 场景 | 所需 VRAM | 当前 48GB | A100 80GB |
+|------|----------|-----------|-----------|
+| VACE 全量加载 | ~45 GB | ❌ OOM | ✅ |
+| VACE block offload 推理 | ~15 GB 峰值 | ✅ ~136s/step | 不需要 |
+| VACE 全量推理 | ~40 GB | ❌ | ✅ ~20s/step |
+| 训练（正确梯度流） | ~55-65 GB | ❌ OOM | ✅ |
+| 训练（gradient checkpointing）| ~45-50 GB | ❌ 碎片化OOM | ✅ |
+| 训练（代理 loss + block offload）| ~15 GB | ✅ ~1.5min/step | 不推荐 |
+
+### 训练瓶颈与方案
+
+**问题**: 48GB 无法跑完整梯度流训练（DiT forward 不带 no_grad 需要保存 activations）。
+- gradient checkpointing 与 block offload 不兼容（recompute 时 tensors 在 CPU）
+- 全量加载 34.7GB 模型后只剩 ~10GB，不够 activations + gradients
+
+**代理 loss 方案**（当前实现）:
+1. no_grad 跑 DiT forward，hook 捕获 5 个关键 block 的 hidden states（存 CPU）
+2. 用真实 hidden states 跑 adapter forward（有 grad）
+3. Loss = adapter 输出幅度 + 时序平滑 + 多样性
+4. 缺点：adapter 没有参与真正的去噪过程，训练信号弱
+
+**推荐方案**: 租 A100 80GB 跑训练，checkpoint 拿回 48GB 机器推理
+
+### FantasyTalking 权重对接
+
+```
+Checkpoint 结构: {'proj_model': OrderedDict, 'audio_processor': dict}
+
+Key 映射:
+  ckpt['proj_model']                              → AudioProjModel (直接匹配)
+  blocks.{i}.cross_attn.processor.k_proj.weight   → k_audio.weight
+  blocks.{i}.cross_attn.processor.v_proj.weight   → v_audio.weight
+  audio_scale                                     → 不在 checkpoint 中，需手动初始化为 0.5
+
+符号链接:
+  data/models/fantasytalking_audio_adapter.ckpt → fantasytalking_model.ckpt
+```
+
+### 第三方代码修改记录（2026-04-04）
 
 以下文件已被修改以适配本项目，换机器后需要重新 apply：
 
-**third_party/Wan2.1/wan/vace.py**（核心修改）:
+**third_party/Wan2.1/wan/vace.py**:
 
-- `__init__` 第 121-136 行：替换 `self.model.to(self.device)` 为手动 block offload 逻辑（非 block 参数上 GPU，blocks 留 CPU）
-- `generate` 第 389-398 行：VAE encode 后释放 VAE 显存 + z 移到 CPU
-- `generate` 第 447-449 行：去噪循环前把 context 搬回 GPU
-- `generate` 第 459-473 行：每步把 z 搬到 GPU，推理完释放
-- `generate` 第 487-488 行：去噪完把 VAE 搬回 GPU 做 decode
+- `__init__`: VRAM 阈值判断（≥52GB 全量加载，<52GB block offload）
+- `generate`: VAE encode 后释放显存 + z 移 CPU；去噪循环中逐步搬 z 到 GPU
+- 保持了原有的 generate、prepare_source 等 API 不变
 
-**third_party/Wan2.1/wan/modules/vace_model.py**（block offload + device alignment）:
+**third_party/Wan2.1/wan/modules/vace_model.py**:
 
-- `forward` 第 193-200 行：所有输入 tensor 对齐到 patch_embedding 设备
-- `forward` 第 252-255 行：main blocks 循环改为逐 block 搬 GPU→推理→搬回 CPU
-- `forward_vace` 第 137-158 行：vace_blocks 同上处理
+- `forward` / `forward_vace`: block 循环检查 `_manual_offload` 标志决定是否搬 block
+- 所有输入 tensor 对齐到 patch_embedding 设备
 
-**third_party/Wan2.1/wan/modules/attention.py**（flash_attn fallback）:
+**third_party/Wan2.1/wan/modules/attention.py**:
 
-- 第 111-139 行：当 flash_attn 2/3 都不可用时，fallback 到 `F.scaled_dot_product_attention`
-- ⚠️ **此 fallback 有 bug**：varlen attention 的 unflatten 格式转换不正确，是进程 crash 的直接原因
-- 新机器上如果能装 flash_attn 就不需要这个 fallback
+- try/except 捕获 `(ImportError, ModuleNotFoundError)`（兼容 flash_attn 二进制不兼容）
+- SDPA fallback 重写：支持等长序列（简单 unflatten）和变长序列（pad + attention mask）
+
+**third_party/Wan2.1/wan/modules/model.py**:
+
+- `WanAttentionBlock.forward`: self-attn 后注入 audio cross-attention hook
+  ```python
+  audio_proc = getattr(self, 'audio_processor', None)
+  if audio_proc is not None and audio_proc._audio_cond is not None:
+      x = x + audio_proc(x, audio_cond, n_latent_frames)
+  ```
 
 ### SAM2 使用注意事项
 

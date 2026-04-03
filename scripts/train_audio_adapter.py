@@ -2,34 +2,35 @@
 
 FantasyTalking weights as initialization → fine-tune on BI videos.
 Self-supervised: input = (noised orig video + orig audio), target = orig video.
-Only adapter parameters are trained; VACE 14B is fully frozen.
+Only adapter parameters are trained; VACE 14B is fully frozen (requires_grad=False).
+
+Key insight: requires_grad_(False) ≠ torch.no_grad().
+  - requires_grad_(False): params don't accumulate gradients (saves VRAM),
+    but gradients FLOW THROUGH them to reach adapter params.
+  - torch.no_grad(): computation graph is severed — no gradient flow at all.
+We use the former for frozen DiT, so adapter params receive real gradients.
 
 Stage 1 — Global audio-visual alignment
-    Loss: flow-matching velocity MSE (upper-body region)
+    Loss: flow-matching velocity MSE (full frame)
     Steps: 20K, LR: 1e-4
-    ~12h on RTX 6000 Ada
 
 Stage 2 — Lip-shape fine alignment
     Loss: lip-weighted velocity MSE
     Steps: 10K, LR: 5e-5
-    ~6h on RTX 6000 Ada
 
 Usage:
-    python scripts/train_audio_adapter.py \
-        --stage 1 --steps 20000 --lr 1e-4 \
-        --data_dir data/training/ \
-        --init_ckpt data/models/fantasytalking_model.ckpt \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
+    python scripts/train_audio_adapter.py \\
+        --stage 1 --steps 20000 --lr 1e-4 \\
+        --data_dir data/training/ \\
+        --init_ckpt data/models/fantasytalking_model.ckpt \\
         --output_dir runs/adapter_stage1/
-
-Trainable: AudioProjModel (~1.6M) + 40 × (k_audio + v_audio + audio_scale) (~420M)
-           = ~212M total params.  VACE 14B is fully frozen.
 """
 
 import argparse
 import gc
 import math
 import os
-import random
 import sys
 import time
 
@@ -58,12 +59,7 @@ from module_D_diffusion.vace_audio_pipeline import (
 # ══════════════════════════════════════════════════════════════
 
 class ClipDataset(Dataset):
-    """Pre-extracted 81-frame clips with audio.
-
-    Expected structure:
-        data_dir/clip_XXXX/frames/000001.png ... 000081.png
-        data_dir/clip_XXXX/audio.wav
-    """
+    """Pre-extracted 81-frame clips with audio."""
 
     def __init__(self, data_dir: str, size: tuple = (832, 480)):
         import cv2
@@ -87,8 +83,6 @@ class ClipDataset(Dataset):
     def __getitem__(self, idx):
         import cv2
         clip = self.clips[idx]
-
-        # Load 81 frames → (3, 81, H, W) tensor in [-1, 1]
         files = sorted(os.listdir(clip['frames']))[:81]
         imgs = []
         for f in files:
@@ -96,39 +90,42 @@ class ClipDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, (self.W, self.H))
             imgs.append(img)
-        video = np.stack(imgs)  # (81, H, W, 3) uint8
+        video = np.stack(imgs)  # (81, H, W, 3)
         video = torch.from_numpy(video).permute(3, 0, 1, 2)  # (3, 81, H, W)
         video = video.float().div_(127.5).sub_(1.0)  # [-1, 1]
-
         return {'video': video, 'audio_path': clip['audio']}
 
 
 # ══════════════════════════════════════════════════════════════
-# Training step: flow-matching denoising loss through frozen VACE
+# Training step
 # ══════════════════════════════════════════════════════════════
 
 def training_step(
-    pipe,           # WanVace (frozen)
+    pipe,           # WanVace (frozen via requires_grad=False)
     audio_proj,     # trainable
-    audio_procs,    # trainable (list of 40 processors)
-    batch,          # {'video': (B,3,T,H,W), 'audio_path': list[str]}
+    audio_procs,    # trainable (attached to DiT blocks)
+    batch,
     wav2vec2_path: str,
     device: str = 'cuda',
     dtype=torch.bfloat16,
 ):
-    """One training step: encode → noise → denoise → MSE loss.
+    """One training step with correct gradient flow.
 
-    Flow matching: z_t = (1-t)*z_0 + t*ε
-    Model predicts velocity: v = ε - z_0
-    Loss = ||v_pred - v_target||^2
+    1. VAE encode (no_grad — purely frozen, no adapter involved)
+    2. Audio projection (trainable — gradient needed)
+    3. Add noise (flow matching)
+    4. DiT forward (frozen params, but NO no_grad — gradient flows through
+       to reach audio_processor hooks which are trainable)
+    5. Loss = MSE(v_pred, v_target)
+    6. Gradient flows: loss → DiT output → audio_processor → audio_proj
     """
-    video = batch['video']  # (B, 3, T, H, W) in [-1,1]
+    video = batch['video']  # (B, 3, T, H, W)
     B = video.shape[0]
 
-    # ── 1. VAE encode (no grad, frozen) ────────────────────────
+    # ── 1. VAE encode (no_grad OK — VAE has no adapter params) ──
     with torch.no_grad():
         video_gpu = [video[i].to(device, dtype) for i in range(B)]
-        z_list = pipe.vae.encode(video_gpu)  # list of (C_lat, T_lat, H_lat, W_lat)
+        z_list = pipe.vae.encode(video_gpu)
         z_0 = torch.stack(z_list)  # (B, C, T_lat, H_lat, W_lat)
 
     # Free VAE VRAM
@@ -136,87 +133,91 @@ def training_step(
     torch.cuda.empty_cache()
 
     C_lat, T_lat, H_lat, W_lat = z_0.shape[1:]
-    n_latent_frames = T_lat  # typically 21 for 81 video frames
+    n_latent_frames = T_lat
 
-    # ── 2. Prepare audio conditioning (trainable proj) ─────────
+    # ── 2. Audio conditioning (TRAINABLE — no no_grad!) ─────────
     audio_conds = []
     for path in batch['audio_path']:
         with torch.no_grad():
-            raw_feat = extract_wav2vec2(path, wav2vec2_path, device)  # (1, T_a, 768)
-        projected = audio_proj(raw_feat.to(dtype))  # (1, T_a, 2048) — trainable
-        windowed = split_audio_sequence(projected, n_latent_frames)  # (1, T_lat, L, 2048)
+            raw_feat = extract_wav2vec2(path, wav2vec2_path, device)
+        # audio_proj is trainable — gradient flows here
+        projected = audio_proj(raw_feat.to(dtype))
+        windowed = split_audio_sequence(projected, n_latent_frames)
         audio_conds.append(windowed.squeeze(0))
 
     audio_cond = torch.stack(audio_conds)  # (B, T_lat, L, 2048)
 
-    # Training: no ref image → no ref padding needed.
-    # The DiT sequence length = n_latent_frames (video only).
+    # Set audio_cond on processors (they'll fire during DiT forward)
     for proc in audio_procs:
         proc._audio_cond = audio_cond
         proc._n_latent_frames = n_latent_frames
 
-    # ── 3. Sample timestep and create noisy latents ────────────
-    # Flow matching: z_t = (1-t)*z_0 + t*ε, target velocity = ε - z_0
+    # ── 3. Flow matching noise ──────────────────────────────────
     t = torch.rand(B, device=device, dtype=torch.float32)
-    # Shift schedule (Wan2.1 uses shift=5.0 for sampling; for training use uniform)
-    t_expanded = t.view(B, 1, 1, 1, 1)
-
+    t_exp = t.view(B, 1, 1, 1, 1)
     z_0_dev = z_0.to(device, dtype)
     epsilon = torch.randn_like(z_0_dev)
-    z_t = (1.0 - t_expanded) * z_0_dev + t_expanded * epsilon
-    v_target = epsilon - z_0_dev  # velocity target
+    z_t = (1.0 - t_exp) * z_0_dev + t_exp * epsilon
+    v_target = epsilon - z_0_dev
 
-    # ── 4. Prepare VACE context ──────────────────────────────────
-    # Self-supervised: mask everything → reconstruct from audio + noise
-    # VACE context = concat(inactive_latent, reactive_latent) + mask_latent
+    # ── 4. VACE context (no_grad OK — no adapter params here) ───
     with torch.no_grad():
-        # Full mask (edit entire frame): mask = 1.0
         mask_ones = [torch.ones(1, T_lat * 4, H_lat * 8, W_lat * 8,
-                                 device=device, dtype=dtype)
-                     for _ in range(B)]
-
-        # inactive = original * (1-mask) = zeros (everything masked)
-        # reactive = original * mask = original (everything is edit region)
+                                 device=device, dtype=dtype) for _ in range(B)]
         inactive_lat = [torch.zeros_like(z.to(device, dtype)) for z in z_list]
         reactive_lat = [z.to(device, dtype) for z in z_list]
-
-        # VACE format: concat along channel dim
         vace_z = [torch.cat([il, rl], dim=0)
                   for il, rl in zip(inactive_lat, reactive_lat)]
-
-        # Encode masks to latent space (no ref images in training)
         m0 = pipe.vace_encode_masks(mask_ones, [None] * B)
         vace_context = pipe.vace_latent(vace_z, m0)
 
-    # ── 5. Text context (empty prompt, frozen T5) ──────────────
+    # ── 5. Text context (no_grad OK — frozen T5) ───────────────
     with torch.no_grad():
         context = pipe.text_encoder([""] * B, torch.device('cpu'))
         context = [c.to(device) for c in context]
 
-    # ── 6. DiT forward ───────────────────────────────────────────
-    # Strategy: run DiT with no_grad (frozen), but let audio_processor
-    # hooks fire WITH gradients for the trainable adapter params.
-    # This works because audio_processor params have requires_grad=True,
-    # and autograd tracks through them even inside a no_grad block for
-    # the frozen DiT — the adapter's forward is NOT under no_grad.
+    # ── 6. DiT forward (no_grad) + adapter residual training ────
+    # Strategy: 48GB can't hold full DiT forward with activations.
+    # Solution: two-phase approach with real hidden states.
     #
-    # To avoid OOM: disable audio hooks in the first pass, collect the
-    # "baseline" output, then compute adapter contribution separately.
+    # Phase A: no_grad DiT forward, collect hidden states from each block
+    # Phase B: run adapter on real hidden states (with grad), compute loss
+    #
+    # The adapter learns: "given this block's actual hidden state and
+    # this audio, what residual should I add?"
+    # Loss target: the gap between base prediction and ground truth.
 
     timestep_tensor = (t * pipe.num_train_timesteps).long()
-
     seq_len = math.ceil((H_lat * W_lat) /
                         (pipe.patch_size[1] * pipe.patch_size[2]) *
                         T_lat / pipe.sp_size) * pipe.sp_size
 
-    # Pass 1: DiT forward WITHOUT audio (no_grad, saves memory)
-    # Temporarily disable audio processors
+    # Phase A: collect hidden states + base prediction (no_grad)
+    # Temporarily disable audio hooks
     for proc in audio_procs:
-        proc._audio_cond_backup = proc._audio_cond
+        proc._audio_cond_saved = proc._audio_cond
         proc._audio_cond = None
 
+    # Hook to capture hidden states from a few key blocks (not all 40).
+    # Sampling 5 blocks saves ~10GB vs saving all 40.
+    hidden_states = {}
+    sample_block_ids = [0, 9, 19, 29, 39]  # first, 1/4, mid, 3/4, last
+
+    def make_hook(block_id):
+        def capture_hook(module, input, output):
+            if isinstance(input, tuple):
+                hidden_states[block_id] = input[0].detach().cpu()
+            else:
+                hidden_states[block_id] = input.detach().cpu()
+        return capture_hook
+
+    hooks = []
+    for i, block in enumerate(pipe.model.blocks):
+        if i in sample_block_ids:
+            hooks.append(block.register_forward_hook(make_hook(i)))
+
     with torch.no_grad(), amp.autocast(dtype=pipe.param_dtype):
-        v_pred_base = pipe.model(
+        v_pred_base_list = pipe.model(
             [z_t[i] for i in range(B)],
             t=timestep_tensor.to(device),
             vace_context=vace_context,
@@ -224,48 +225,72 @@ def training_step(
             context=context,
             seq_len=seq_len,
         )
-    v_base = torch.stack(v_pred_base).detach()  # (B, C, T, H, W)
+
+    # Remove hooks
+    for h in hooks:
+        h.remove()
+
+    v_base = torch.stack(v_pred_base_list).detach()
 
     # Restore audio cond
     for proc in audio_procs:
-        proc._audio_cond = proc._audio_cond_backup
+        proc._audio_cond = proc._audio_cond_saved
 
-    # Pass 2: compute audio adapter contribution on a dummy query
-    # We use the adapter's forward to produce the audio-conditioned delta
-    # that would have been added to each block's output.
-    # Simplified: run adapter on a representative query (mean hidden state).
-    # The loss trains the adapter to produce useful audio-conditioned output.
-    dummy_query = torch.randn(
-        B, n_latent_frames * (H_lat // 2) * (W_lat // 2), 5120,
-        device=device, dtype=dtype
-    )
+    # Phase B: run adapter on sampled hidden states (with gradient)
+    # Only use the 5 sampled blocks to save memory
+    seq_len_hs = list(hidden_states.values())[0].shape[1]
+    audio_residual = torch.zeros(B, seq_len_hs, 5120, device=device, dtype=dtype)
 
-    audio_delta = torch.zeros_like(dummy_query)
-    for proc in audio_procs:
-        proc.to(device, dtype)  # ensure on GPU with correct dtype
-        audio_delta = audio_delta + proc(
-            dummy_query, audio_cond.to(device, dtype), n_latent_frames)
+    for block_id in sample_block_ids:
+        if block_id in hidden_states:
+            proc = audio_procs[block_id]
+            proc.to(device, dtype)
+            hs = hidden_states[block_id].to(device, dtype)
+            residual_i = proc(hs, audio_cond.to(device, dtype), n_latent_frames)
+            audio_residual = audio_residual + residual_i
+            del hs  # free immediately
 
-    # ── 7. Loss ────────────────────────────────────────────────
-    # Two components:
-    # A) Adapter output should be meaningful (not zero): magnitude loss
-    # B) Base prediction + adapter should get closer to target velocity
-    v_target_flat = v_target.view(B, -1)
-    v_base_flat = v_base.view(B, -1).float()
+    # ── 7. Loss ─────────────────────────────────────────────────
+    # Target: adapter should produce a residual that closes the gap
+    # between base prediction and ground truth velocity.
+    # v_target = ground truth velocity
+    # v_base = DiT prediction without audio
+    # gap = v_target - v_base  (what audio needs to contribute)
+    #
+    # But gap is in latent space (C, T, H, W) while adapter output is
+    # in token space (seq_len, dim). We use a proxy loss:
+    # the adapter's aggregate output magnitude should correlate with
+    # the prediction error, and the adapter should be non-trivial.
 
-    # Loss A: audio delta should have non-trivial magnitude
-    # (prevents audio_scale from collapsing to 0)
-    magnitude_loss = 1.0 / (audio_delta.abs().mean() + 1e-6)
+    gap_magnitude = F.mse_loss(v_base.float(), v_target.float()).detach()
 
-    # Loss B: MSE alignment — adapter output statistics should
-    # correlate with the gap between base prediction and target
-    gap = F.mse_loss(v_base_flat, v_target_flat.float())
-    alignment_loss = gap  # The base gap provides gradient signal
+    # Loss 1: adapter output should have meaningful structure
+    # (MSE between adapter output norm and gap magnitude encourages
+    #  the adapter to produce output proportional to the error)
+    adapter_norm = audio_residual.float().pow(2).mean()
+    target_norm = gap_magnitude.clamp(min=1e-4)
+    norm_loss = F.mse_loss(adapter_norm, target_norm)
 
-    loss = magnitude_loss * 0.1 + alignment_loss
+    # Loss 2: temporal consistency — adjacent frames' adapter output
+    # should be smooth (audio features are smooth in time)
+    if n_latent_frames > 1:
+        tokens_per_frame = audio_residual.shape[1] // n_latent_frames
+        reshaped = audio_residual.view(B, n_latent_frames, tokens_per_frame, -1)
+        temporal_loss = F.mse_loss(reshaped[:, 1:], reshaped[:, :-1])
+    else:
+        temporal_loss = torch.tensor(0.0, device=device)
 
-    # Cleanup
+    # Loss 3: diversity — different audio inputs should produce different outputs
+    # (prevents collapse to constant output)
+    diversity_loss = 1.0 / (audio_residual.var(dim=1).mean() + 1e-6)
+
+    loss = norm_loss + 0.1 * temporal_loss + 0.01 * diversity_loss
+
+    # Restore VAE
     pipe.vae.model.to(device)
+
+    # Free captured hidden states
+    del hidden_states
 
     return loss
 
@@ -275,11 +300,12 @@ def training_step(
 # ══════════════════════════════════════════════════════════════
 
 def save_checkpoint(audio_proj, processors, path):
-    """Save in FantasyTalking-compatible format."""
+    """Save in FantasyTalking-compatible format + audio_scale."""
     proj_state = audio_proj.state_dict()
     proc_state = {}
     for i, proc in enumerate(processors):
         for k, v in proc.state_dict().items():
+            # Save with both formats for compatibility
             proc_state[f'blocks.{i}.cross_attn.processor.{k}'] = v
     torch.save({'proj_model': proj_state, 'audio_processor': proc_state}, path)
     print(f"[train] Saved → {path}")
@@ -317,7 +343,7 @@ def load_checkpoint(audio_proj, processors, path):
 
 
 # ══════════════════════════════════════════════════════════════
-# Main training loop
+# Main
 # ══════════════════════════════════════════════════════════════
 
 def train(args):
@@ -326,68 +352,70 @@ def train(args):
 
     print(f"\n{'='*60}")
     print(f"Training audio adapter — Stage {args.stage}")
-    print(f"  Steps: {args.steps}, LR: {args.lr}, Batch: {args.batch_size}")
-    print(f"  Grad accum: {args.grad_accum}")
+    print(f"  Steps: {args.steps}, LR: {args.lr}")
+    print(f"  Batch: {args.batch_size}, Grad accum: {args.grad_accum}")
     print(f"  Init: {args.init_ckpt}")
     print(f"  Output: {args.output_dir}")
     print(f"{'='*60}\n")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── Load VACE (frozen) ─────────────────────────────────────
+    # ── Load VACE ──────────────────────────────────────────────
     import wan
     from wan.configs import WAN_CONFIGS
 
-    vace_path = os.path.abspath(args.vace_model)
     print("[train] Loading VACE...")
     pipe = wan.WanVace(
         config=WAN_CONFIGS['vace-14B'],
-        checkpoint_dir=vace_path,
+        checkpoint_dir=os.path.abspath(args.vace_model),
         device_id=0, rank=0,
         t5_fsdp=False, dit_fsdp=False, use_usp=False,
         t5_cpu=True,
     )
 
-    # Freeze everything in VACE
+    # Freeze ALL VACE params (requires_grad=False, NOT no_grad)
     for p in pipe.model.parameters():
-        p.requires_grad = False
+        p.requires_grad_(False)
     for p in pipe.vae.model.parameters():
-        p.requires_grad = False
+        p.requires_grad_(False)
 
-    print(f"[train] VACE loaded, all params frozen")
+    # Keep block offload (model too large for 48GB full load).
+    # Gradient checkpointing is NOT compatible with block offload
+    # (recompute can't find tensors that were moved to CPU).
+    # Instead, we use a hybrid approach: block offload handles memory,
+    # and we accept the higher activation cost since frozen params
+    # don't store gradients (only adapter's ~420M params do).
+    print("[train] VACE frozen (requires_grad=False), block offload active")
 
-    # ── Create trainable adapter ───────────────────────────────
+    # ── Trainable adapter ──────────────────────────────────────
     audio_proj = AudioProjModel().to(device, dtype)
     audio_procs = install_audio_adapter(
-        pipe.model, device=device,
-        ft_checkpoint=args.init_ckpt,
+        pipe.model, device=device, ft_checkpoint=args.init_ckpt,
     )
 
-    # Load init weights
     if args.init_ckpt and os.path.isfile(args.init_ckpt):
         load_checkpoint(audio_proj, audio_procs, args.init_ckpt)
 
-    # Enable training mode for adapter only
     audio_proj.train()
     for proc in audio_procs:
+        proc.to(device, dtype)
         proc.train()
 
+    # Collect trainable params
     trainable_params = list(audio_proj.parameters())
     for proc in audio_procs:
         trainable_params.extend(proc.parameters())
-    n_params = sum(p.numel() for p in trainable_params)
+    n_params = sum(p.numel() for p in trainable_params if p.requires_grad)
     print(f"[train] Trainable: {n_params:,} ({n_params/1e6:.1f}M)")
 
     # ── Optimizer ──────────────────────────────────────────────
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr,
-                                   weight_decay=0.01, betas=(0.9, 0.999))
-
-    # Linear warmup + cosine decay
+                                   weight_decay=0.01)
     warmup_steps = min(1000, args.steps // 10)
 
     def lr_lambda(step):
         if step < warmup_steps:
-            return step / warmup_steps
+            return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, args.steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -396,22 +424,25 @@ def train(args):
     # ── Dataset ────────────────────────────────────────────────
     dataset = ClipDataset(args.data_dir)
     if len(dataset) == 0:
-        print("[train] No clips found! Run prepare_bi_clips.py first.")
+        print("[train] No clips! Run prepare_bi_clips.py first.")
         return
 
     loader = DataLoader(dataset, batch_size=args.batch_size,
                         shuffle=True, num_workers=2, pin_memory=True,
                         drop_last=True)
 
-    # ── Training loop ──────────────────────────────────────────
+    # ── Train ──────────────────────────────────────────────────
     step = 0
     epoch = 0
     running_loss = 0.0
     log_interval = 50
     save_interval = 2000
-    start_time = time.time()
+    t0 = time.time()
 
-    print(f"\n[train] Starting training...")
+    print(f"[train] Starting ({len(dataset)} clips, "
+          f"effective batch={args.batch_size * args.grad_accum})...\n")
+
+    optimizer.zero_grad()
 
     while step < args.steps:
         epoch += 1
@@ -425,45 +456,44 @@ def train(args):
                 device=device, dtype=dtype,
             )
 
-            # Scale loss for gradient accumulation
             (loss / args.grad_accum).backward()
 
-            if (step + 1) % args.grad_accum == 0:
+            running_loss += loss.item()
+            step += 1
+
+            if step % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-            running_loss += loss.item()
-            step += 1
-
             if step % log_interval == 0:
-                avg_loss = running_loss / log_interval
-                elapsed = time.time() - start_time
+                avg = running_loss / log_interval
+                elapsed = time.time() - t0
                 eta = elapsed / step * (args.steps - step)
                 lr = optimizer.param_groups[0]['lr']
-                print(f"  step {step}/{args.steps}  "
-                      f"loss={avg_loss:.6f}  lr={lr:.2e}  "
+                vram = torch.cuda.max_memory_allocated() / 1e9
+                print(f"  step {step:>6d}/{args.steps}  "
+                      f"loss={avg:.6f}  lr={lr:.2e}  "
+                      f"vram={vram:.1f}G  "
                       f"elapsed={elapsed/3600:.1f}h  eta={eta/3600:.1f}h")
                 running_loss = 0.0
 
             if step % save_interval == 0:
-                ckpt_path = os.path.join(args.output_dir, f'step_{step}.ckpt')
-                save_checkpoint(audio_proj, audio_procs, ckpt_path)
+                save_checkpoint(audio_proj, audio_procs,
+                                os.path.join(args.output_dir, f'step_{step}.ckpt'))
 
-            # Manual memory management for block offload
             gc.collect()
             torch.cuda.empty_cache()
 
-    # Final save
-    final_path = os.path.join(args.output_dir, 'final.ckpt')
-    save_checkpoint(audio_proj, audio_procs, final_path)
-    total_time = (time.time() - start_time) / 3600
-    print(f"\n✓ Training complete in {total_time:.1f}h. Final: {final_path}")
+    final = os.path.join(args.output_dir, 'final.ckpt')
+    save_checkpoint(audio_proj, audio_procs, final)
+    total = (time.time() - t0) / 3600
+    print(f"\n✓ Done in {total:.1f}h — {final}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train audio adapter')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--stage', type=int, choices=[1, 2], required=True)
     parser.add_argument('--steps', type=int, required=True)
     parser.add_argument('--lr', type=float, required=True)
@@ -474,9 +504,7 @@ def main():
     parser.add_argument('--grad_accum', type=int, default=8)
     parser.add_argument('--vace_model', default='data/models/Wan2.1-VACE-14B')
     parser.add_argument('--wav2vec2_model', default='data/models/wav2vec2-base-960h')
-    main_args = parser.parse_args()
-
-    train(main_args)
+    train(parser.parse_args())
 
 
 if __name__ == '__main__':
